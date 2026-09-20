@@ -11,6 +11,15 @@ Form options: manufacturer (default Cisco), device types (default all), severiti
 High, Medium) and lookback days (default 90, by first-published date). Journal kind: Critical = danger,
 High = warning, Medium/Low/Informational = info.
 
+### Enrichment
+
+Each entry also shows [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) status
+(known exploited, kind becomes danger whatever Cisco's rating) and the highest
+[FIRST EPSS](https://www.first.org/epss/) exploit probability, as of the run date. If an advisory's CVE
+is added to KEV after it was journaled, one follow-up entry is written. Both feeds are public, need no
+credentials, and the worker needs outbound access to `cisa.gov` and `api.first.org`. If a feed is
+unreachable the run warns and continues without it.
+
 ### Platforms
 
 The version comes only from the device's platform, which must be a tree of OS > version. The leaf
@@ -27,7 +36,7 @@ Recognised OS platforms (by slug or name): `ios`, `ios-xe`/`iosxe`, `nxos`/`nx-o
 
 Devices with no platform or a platform outside an OS tree are skipped with a warning. So is a platform
 whose version Cisco rejects or whose API call fails (one warning per platform). Advisories Cisco later
-revises are not re-posted.
+revises are not re-posted, and EPSS is not refreshed after an entry is written.
 
 ### Credentials
 

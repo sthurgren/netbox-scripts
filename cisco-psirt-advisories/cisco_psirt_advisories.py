@@ -7,6 +7,10 @@ The version comes only from the device's platform, which must be a tree of OS > 
 (Cisco > IOS-XE > 17.18.2) and is expected to be correct: a device whose platform cannot be used is
 skipped with a warning. Re-runs never repeat an entry.
 
+Entries are enriched from two public feeds (no credentials): CISA KEV marks CVEs known to be exploited,
+and FIRST EPSS gives the 30-day exploitation probability. An advisory whose CVE is later added to KEV
+gets one follow-up entry.
+
 Credentials are read at run time from the environment, never from the form (script inputs are stored
 on the Job record). See README.md.
 """
@@ -27,6 +31,11 @@ from utilities.exceptions import AbortScript
 
 DEFAULT_BASE_URL = 'https://apix.cisco.com/security/advisories/v2'
 DEFAULT_TOKEN_URL = 'https://id.cisco.com/oauth2/default/v1/token'
+KEV_URL = 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json'
+EPSS_URL = 'https://api.first.org/data/v1/epss'
+EPSS_BATCH = 100  # CVEs per EPSS request
+# Present in every entry that reports a KEV listing; a journaled advisory without it gets a follow-up
+KEV_MARKER = 'CISA KEV'
 
 SEVERITY_CHOICES = (
     ('Critical', 'Critical'),
@@ -181,8 +190,86 @@ class PSIRTClient:
         return self._get(f'OSType/{os_type}', {'version': version})
 
 
-def render_entry(advisory, os_type, version):
-    """Markdown body for one advisory. The first line carries the advisory ID (used for dedup)."""
+def fetch_kev():
+    """CISA Known Exploited Vulnerabilities catalog as {cveID: entry}."""
+    try:
+        resp = requests.get(KEV_URL, timeout=60)
+        resp.raise_for_status()
+        return {v['cveID']: v for v in resp.json()['vulnerabilities']}
+    except (requests.RequestException, ValueError, KeyError) as e:
+        raise PSIRTError(f"KEV: {e.__class__.__name__}")
+
+
+def fetch_epss(cves):
+    """FIRST EPSS as {cve: (probability, percentile, date)}; CVEs FIRST has no score for are absent."""
+    cves = sorted(cves)
+    scores = {}
+    for i in range(0, len(cves), EPSS_BATCH):
+        try:
+            resp = requests.get(EPSS_URL, params={'cve': ','.join(cves[i:i + EPSS_BATCH])}, timeout=60)
+            resp.raise_for_status()
+            for row in resp.json().get('data') or []:
+                scores[row['cve']] = (float(row['epss']), float(row['percentile']), row['date'])
+        except (requests.RequestException, ValueError, KeyError) as e:
+            raise PSIRTError(f"EPSS: {e.__class__.__name__}")
+    return scores
+
+
+def cves_of(advisory):
+    return advisory.get('cves') or []
+
+
+def kev_matches(advisory, kev):
+    """KEV entries for the advisory's CVEs, earliest addition first."""
+    return sorted((kev[c] for c in cves_of(advisory) if c in kev), key=lambda e: e['dateAdded'])
+
+
+def top_epss(advisory, epss):
+    """Highest (probability, percentile, date) among the advisory's CVEs, or None."""
+    return max((epss[c] for c in cves_of(advisory) if c in epss), default=None)
+
+
+def kev_line(matches):
+    line = f"**Actively exploited** ({KEV_MARKER}, added {matches[0]['dateAdded']}"
+    if any(m.get('knownRansomwareCampaignUse') == 'Known' for m in matches):
+        line += ", used in ransomware campaigns"
+    return line + ")"
+
+
+def needs_kev_followup(adv_id, existing):
+    """True if the advisory is already journaled but no entry for it reports the KEV listing."""
+    entries = [c for c in existing if adv_id in c]
+    return bool(entries) and not any(KEV_MARKER in c for c in entries)
+
+
+def write_entry(platform, kind, comments, user):
+    entry = JournalEntry(assigned_object=platform, kind=kind, comments=comments, created_by=user)
+    entry.full_clean()
+    entry.save()
+
+
+def render_kev_followup(advisory, matches):
+    """Markdown body reporting that an already journaled advisory has since entered KEV."""
+    adv_id = advisory.get('advisoryId')
+    lines = [
+        f"**{adv_id}**",
+        '',
+        f"### Update: {advisory.get('advisoryTitle') or adv_id}",
+        kev_line(matches),
+        '',
+        f"CVEs in KEV: {', '.join(m['cveID'] for m in matches)}",
+    ]
+    if advisory.get('publicationUrl'):
+        lines += ['', f"[Cisco advisory]({advisory['publicationUrl']})"]
+    return '\n'.join(lines)
+
+
+def render_entry(advisory, os_type, version, kev=(), epss=None):
+    """
+    Markdown body for one advisory. The first line carries the advisory ID (used for dedup).
+
+    kev is the advisory's KEV matches (kev_matches) and epss its top score (top_epss), both optional.
+    """
     adv_id = advisory.get('advisoryId')
     published = parse_date(advisory.get('firstPublished'))
     facts = [
@@ -197,7 +284,15 @@ def render_entry(advisory, os_type, version):
         ' · '.join(f for f in facts if f),
         '',
     ]
-    cves = advisory.get('cves') or []
+    if kev:
+        lines += [kev_line(kev), '']
+    if epss:
+        lines += [
+            f"EPSS: {epss[0]:.2%} chance of exploitation in the next 30 days, more likely than "
+            f"{epss[1] * 100:.2f}% of all CVEs (as of {epss[2]})",
+            '',
+        ]
+    cves = cves_of(advisory)
     if cves:
         lines += [f"CVEs: {', '.join(cves)}", '']
     affects = f"Affects `{os_type} {version}`"
@@ -215,7 +310,8 @@ class CiscoPSIRTAdvisories(Script):
         name = "Cisco PSIRT Advisories"
         description = (
             "Pull Cisco security advisories from the PSIRT openVuln API for the software version each "
-            "device runs, and write each one to the platform journal."
+            "device runs, and write each one to the platform journal, enriched with CISA KEV and "
+            "FIRST EPSS."
         )
         commit_default = False
         scheduling_enabled = True
@@ -264,6 +360,12 @@ class CiscoPSIRTAdvisories(Script):
             raise AbortScript(f"Cisco authentication failed: {e}")
         self.log_debug("Obtained Cisco API token.")
 
+        try:
+            kev = fetch_kev()
+        except PSIRTError as e:
+            kev = {}
+            self.log_warning(f"CISA KEV unavailable, continuing without it: {e}")
+
         manufacturer = data.get('manufacturer') or Manufacturer.objects.filter(slug='cisco').first()
         if manufacturer is None:
             raise AbortScript("No manufacturer selected and no manufacturer with slug 'cisco' exists.")
@@ -279,7 +381,9 @@ class CiscoPSIRTAdvisories(Script):
 
         cache = {}  # (os_type, version) -> advisories, or None if Cisco does not recognise the version
         platforms = {}  # platform -> (software, device names); only platforms that a device uses
-        totals = {'created': 0, 'existing': 0, 'devices skipped': 0, 'platforms skipped': 0}
+        epss = {}  # cve -> (probability, percentile, date), fetched only for advisories about to be written
+        epss_ok = True
+        totals = {'created': 0, 'kev follow-ups': 0, 'existing': 0, 'devices skipped': 0, 'platforms skipped': 0}
 
         for device in devices:
             if device.platform is None:
@@ -327,22 +431,44 @@ class CiscoPSIRTAdvisories(Script):
                 JournalEntry.objects.filter(assigned_object_type=ct, assigned_object_id=platform.pk)
                 .values_list('comments', flat=True)
             )
-            created = 0
+            pending = []
             for adv in sorted(relevant, key=lambda a: a['advisoryId']):
                 if any(adv['advisoryId'] in comments for comments in existing):
                     totals['existing'] += 1
-                    continue
-                entry = JournalEntry(
-                    assigned_object=platform,
-                    kind=SEVERITY_KIND.get((adv.get('sir') or '').lower(), 'info'),
-                    comments=render_entry(adv, *software),
-                    created_by=user,
+                else:
+                    pending.append(adv)
+
+            wanted = {c for adv in pending for c in cves_of(adv)} - epss.keys()
+            if epss_ok and wanted:
+                try:
+                    epss.update(fetch_epss(wanted))
+                except PSIRTError as e:
+                    epss_ok = False
+                    self.log_warning(f"FIRST EPSS unavailable, continuing without scores: {e}")
+
+            created = 0
+            for adv in pending:
+                matches = kev_matches(adv, kev)
+                write_entry(
+                    platform,
+                    'danger' if matches else SEVERITY_KIND.get((adv.get('sir') or '').lower(), 'info'),
+                    render_entry(adv, *software, kev=matches, epss=top_epss(adv, epss)),
+                    user,
                 )
-                entry.full_clean()
-                entry.save()
                 created += 1
             totals['created'] += created
 
+            # Advisories journaled earlier (whatever their severity or age) whose CVE has since entered KEV
+            followups = 0
+            for adv in sorted(advisories, key=lambda a: a['advisoryId']):
+                matches = kev_matches(adv, kev)
+                if matches and needs_kev_followup(adv['advisoryId'], existing):
+                    write_entry(platform, 'danger', render_kev_followup(adv, matches), user)
+                    followups += 1
+            totals['kev follow-ups'] += followups
+
+            if followups:
+                self.log_warning(f"{label}: {followups} journaled advisories are now in CISA KEV.", platform)
             if created:
                 self.log_success(f"{label}: wrote {created} new advisory journal entries.", platform)
             elif relevant:
@@ -351,7 +477,8 @@ class CiscoPSIRTAdvisories(Script):
                 self.log_info(f"{label}: no matching advisories in the selected window.", platform)
 
         return (
-            f"{totals['created']} entries created, {totals['existing']} already recorded, "
+            f"{totals['created']} entries created, {totals['kev follow-ups']} KEV follow-ups, "
+            f"{totals['existing']} already recorded, "
             f"{totals['devices skipped']} devices and {totals['platforms skipped']} platforms skipped "
             "(see warnings)."
         )
